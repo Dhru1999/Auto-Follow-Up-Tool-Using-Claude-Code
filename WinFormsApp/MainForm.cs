@@ -99,7 +99,7 @@ namespace FollowUpTool
             LoadSettings();
             if (string.IsNullOrEmpty(_settings.AppPassword))
             {
-                _settings.AppPassword = "eote kaup xzhi gcfp";
+                _settings.AppPassword = "Enter your Gmail App Password here";
                 SaveSettings();
             }
             BuildUI();
