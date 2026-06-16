@@ -1,0 +1,34 @@
+# .NET build artifacts
+WinFormsApp/bin/
+WinFormsApp/obj/
+
+# Python cache
+backend/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Python env
+.env
+.venv/
+venv/
+__pycache__/
+
+# User settings / secrets
+*.user
+appsettings.local.json
+appsettings.*.json
+
+# Excel data files (personal data)
+data/*.xlsm
+data/*.xlsx
+data/*.xls
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+*.suo
+*.user
+.vs/
