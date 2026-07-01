@@ -16,7 +16,8 @@ using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using ClosedXML.Excel;
+using System.IO.Compression;
+using System.Xml.Linq;
 
 namespace FollowUpTool
 {
@@ -99,7 +100,7 @@ namespace FollowUpTool
             LoadSettings();
             if (string.IsNullOrEmpty(_settings.AppPassword))
             {
-                _settings.AppPassword = "Enter your Gmail App Password here";
+                _settings.AppPassword = "eote kaup xzhi gcfp";
                 SaveSettings();
             }
             BuildUI();
@@ -456,120 +457,188 @@ namespace FollowUpTool
         {
             var results = new List<JobApplication>();
             var today = DateTime.Today;
+            XNamespace ssNs = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+            XNamespace rNs  = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+            XNamespace pkNs = "http://schemas.openxmlformats.org/package/2006/relationships";
 
-            using var wb = new XLWorkbook(path);
+            using var zip = ZipFile.OpenRead(path);
+
+            // Shared string table
+            var sst = new List<string>();
+            var sstEntry = zip.GetEntry("xl/sharedStrings.xml");
+            if (sstEntry != null)
+            {
+                using var s = sstEntry.Open();
+                foreach (var si in XDocument.Load(s).Descendants(ssNs + "si"))
+                    sst.Add(string.Concat(si.Descendants(ssNs + "t").Select(t => t.Value)));
+            }
+
+            // workbook sheet name → worksheet ZIP path
+            var sheetPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var wbEntry   = zip.GetEntry("xl/workbook.xml");
+            var wbRels    = zip.GetEntry("xl/_rels/workbook.xml.rels");
+            if (wbEntry != null && wbRels != null)
+            {
+                using var ws = wbEntry.Open();
+                using var rs = wbRels.Open();
+                var wbDoc   = XDocument.Load(ws);
+                var relsDoc = XDocument.Load(rs);
+                var ridMap  = relsDoc.Descendants(pkNs + "Relationship")
+                    .ToDictionary(r => r.Attribute("Id")?.Value ?? "", r => r.Attribute("Target")?.Value ?? "");
+                foreach (var sh in wbDoc.Descendants(ssNs + "sheet"))
+                {
+                    var name = sh.Attribute("name")?.Value ?? "";
+                    var rid  = sh.Attribute(rNs + "id")?.Value ?? "";
+                    if (ridMap.TryGetValue(rid, out var target))
+                        sheetPaths[name] = target.StartsWith("xl/") ? target : "xl/" + target;
+                }
+            }
 
             var sheetNames = new[] { "Internship- Data Engineer", "Status", "Job Applications" };
+
             foreach (var sheetName in sheetNames)
             {
-                if (!wb.TryGetWorksheet(sheetName, out var ws)) continue;
+                if (!sheetPaths.TryGetValue(sheetName, out var wsPath)) continue;
+                var wsEntry = zip.GetEntry(wsPath);
+                if (wsEntry == null) continue;
 
-                var usedRange = ws.RangeUsed();
-                if (usedRange == null) continue;
-
-                var firstRow = usedRange.FirstRow();
-                var headers = firstRow.Cells()
-                    .Select(c => MapHeader(c.GetString()))
+                using var wsStream = wsEntry.Open();
+                var wsDoc = XDocument.Load(wsStream);
+                var rows  = wsDoc.Descendants(ssNs + "row")
+                    .OrderBy(r => int.TryParse(r.Attribute("r")?.Value, out int n) ? n : 0)
                     .ToList();
+                if (rows.Count == 0) continue;
 
-                foreach (var row in usedRange.Rows().Skip(1))
+                // column letter → mapped field name
+                var colMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var cell in rows[0].Elements(ssNs + "c"))
                 {
-                    var cells = row.Cells().ToList();
+                    var col    = OxColLetter(cell.Attribute("r")?.Value ?? "");
+                    var header = MapHeader(ZipCellText(cell, sst, ssNs));
+                    if (!string.IsNullOrEmpty(header) && !colMap.ContainsKey(header))
+                        colMap[header] = col;
+                }
+                // invert: field name → column letter
+                var fieldCol = colMap.ToDictionary(kv => kv.Value, kv => kv.Key, StringComparer.OrdinalIgnoreCase);
+                var colField = colMap; // field→col
 
-                    string Get(string field)
-                    {
-                        var idx = headers.IndexOf(field);
-                        return idx >= 0 && idx < cells.Count ? cells[idx].GetString().Trim() : "";
-                    }
+                string Field(XElement row, string name)
+                {
+                    if (!colField.TryGetValue(name, out var col)) return "";
+                    var c = row.Elements(ssNs + "c")
+                        .FirstOrDefault(x => OxColLetter(x.Attribute("r")?.Value ?? "")
+                            .Equals(col, StringComparison.OrdinalIgnoreCase));
+                    return c != null ? ZipCellText(c, sst, ssNs) : "";
+                }
 
-                    var company = Get("Company");
-                    var role = Get("Role");
+                DateTime? FieldDate(XElement row, string name)
+                {
+                    if (!colField.TryGetValue(name, out var col)) return null;
+                    var c = row.Elements(ssNs + "c")
+                        .FirstOrDefault(x => OxColLetter(x.Attribute("r")?.Value ?? "")
+                            .Equals(col, StringComparison.OrdinalIgnoreCase));
+                    return c != null ? ZipParseDate(c, sst, ssNs) : null;
+                }
+
+                foreach (var row in rows.Skip(1))
+                {
+                    var company = Field(row, "Company");
+                    var role    = Field(row, "Role");
                     if (string.IsNullOrEmpty(company) && string.IsNullOrEmpty(role)) continue;
 
-                    // Skip rows already marked as follow-up done
-                    if (Get("FollowupDone").Equals("Yes", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (Field(row, "FollowupDone").Equals("Yes", StringComparison.OrdinalIgnoreCase)) continue;
 
-                    // Status check — skip rejected/withdrawn
-                    var status = Get("Status");
-                    if (status.Equals("Rejected", StringComparison.OrdinalIgnoreCase) ||
-                        status.Equals("Withdrawn", StringComparison.OrdinalIgnoreCase) ||
+                    var status = Field(row, "Status");
+                    if (status.Equals("Rejected",       StringComparison.OrdinalIgnoreCase) ||
+                        status.Equals("Withdrawn",      StringComparison.OrdinalIgnoreCase) ||
                         status.Equals("Offer Received", StringComparison.OrdinalIgnoreCase)) continue;
 
-                    // Parse applied date
-                    DateTime? appliedDate = null;
-                    var appliedIdx = headers.IndexOf("AppliedDate");
-                    if (appliedIdx >= 0 && appliedIdx < cells.Count)
-                    {
-                        var cell = cells[appliedIdx];
-                        if (cell.DataType == XLDataType.DateTime)
-                            appliedDate = cell.GetDateTime();
-                        else if (DateTime.TryParse(cell.GetString(), out var d))
-                            appliedDate = d;
-                        else if (cell.GetString().Contains('.'))
-                        {
-                            var parts = cell.GetString().Split('.');
-                            if (parts.Length == 3 &&
-                                int.TryParse(parts[0], out int day) &&
-                                int.TryParse(parts[1], out int mon) &&
-                                int.TryParse(parts[2], out int yr))
-                                appliedDate = new DateTime(yr < 100 ? 2000 + yr : yr, mon, day);
-                        }
-                    }
+                    var appliedDate  = FieldDate(row, "AppliedDate");
+                    var followUpDate = FieldDate(row, "FollowUpDate");
 
-                    // Parse explicit FollowUpDate if it exists
-                    DateTime? followUpDate = null;
-                    var fuIdx = headers.IndexOf("FollowUpDate");
-                    if (fuIdx >= 0 && fuIdx < cells.Count)
-                    {
-                        var cell = cells[fuIdx];
-                        if (cell.DataType == XLDataType.DateTime)
-                            followUpDate = cell.GetDateTime().Date;
-                        else if (DateTime.TryParse(cell.GetString(), out var d))
-                            followUpDate = d.Date;
-                    }
-
-                    // Fallback: compute follow-up as AppliedDate + 7 days
                     if (followUpDate == null && appliedDate.HasValue)
                         followUpDate = appliedDate.Value.AddDays(7).Date;
 
-                    // Only include if follow-up date is today
                     if (followUpDate?.Date != today) continue;
 
-                    // Skip if already has a response (not "Not yet" / "No yet")
                     var noResponse = string.IsNullOrEmpty(status) ||
-                                     status.Equals("Not yet", StringComparison.OrdinalIgnoreCase) ||
-                                     status.Equals("No yet", StringComparison.OrdinalIgnoreCase) ||
-                                     status.Equals("Applied", StringComparison.OrdinalIgnoreCase) ||
-                                     status.Equals("No Response", StringComparison.OrdinalIgnoreCase);
+                        status.Equals("Not yet",     StringComparison.OrdinalIgnoreCase) ||
+                        status.Equals("No yet",      StringComparison.OrdinalIgnoreCase) ||
+                        status.Equals("Applied",     StringComparison.OrdinalIgnoreCase) ||
+                        status.Equals("No Response", StringComparison.OrdinalIgnoreCase);
                     if (!noResponse) continue;
 
-                    int.TryParse(Get("FollowUpCount"), out int fuCount);
+                    int.TryParse(Field(row, "FollowUpCount"), out int fuCount);
+                    int.TryParse(row.Attribute("r")?.Value, out int rowNum);
 
                     results.Add(new JobApplication
                     {
-                        Company = company,
-                        Role = role,
-                        AppliedDate = appliedDate,
-                        FollowUpDate = followUpDate,
-                        CompanyEmail = Get("CompanyEmail"),
-                        RecruiterEmail = Get("RecruiterEmail"),
-                        HrEmail = Get("HrEmail"),
-                        RecruiterName = Get("RecruiterName"),
-                        Status = status,
-                        Notes = Get("Notes"),
+                        Company       = company,
+                        Role          = role,
+                        AppliedDate   = appliedDate,
+                        FollowUpDate  = followUpDate,
+                        CompanyEmail  = Field(row, "CompanyEmail"),
+                        RecruiterEmail= Field(row, "RecruiterEmail"),
+                        HrEmail       = Field(row, "HrEmail"),
+                        RecruiterName = Field(row, "RecruiterName"),
+                        Status        = status,
+                        Notes         = Field(row, "Notes"),
                         FollowUpCount = fuCount,
-                        SheetName = sheetName,
-                        ExcelRowNumber = cells.Count > 0 ? cells[0].Address.RowNumber : 0
+                        SheetName     = sheetName,
+                        ExcelRowNumber= rowNum
                     });
                 }
             }
 
-            // Deduplicate by Company+Role
             return results
                 .GroupBy(a => $"{a.Company}|{a.Role}")
                 .Select(g => g.First())
                 .OrderBy(a => a.AppliedDate)
                 .ToList();
+        }
+
+        private static string ZipCellText(XElement cell, List<string> sst, XNamespace ns)
+        {
+            var t = cell.Attribute("t")?.Value;
+            var v = cell.Element(ns + "v")?.Value ?? "";
+            if (t == "s")
+            {
+                if (int.TryParse(v, out int i) && i < sst.Count) return sst[i];
+                return "";
+            }
+            if (t == "inlineStr") return cell.Element(ns + "is")?.Element(ns + "t")?.Value ?? "";
+            if (t == "b") return v == "1" ? "TRUE" : "FALSE";
+            return v;
+        }
+
+        private static DateTime? ZipParseDate(XElement cell, List<string> sst, XNamespace ns)
+        {
+            var text = ZipCellText(cell, sst, ns);
+            if (string.IsNullOrEmpty(text)) return null;
+
+            if (DateTime.TryParse(text, out var dt)) return dt.Date;
+
+            if (text.Contains('.'))
+            {
+                var parts = text.Split('.');
+                if (parts.Length == 3 &&
+                    int.TryParse(parts[0], out int day) &&
+                    int.TryParse(parts[1], out int mon) &&
+                    int.TryParse(parts[2], out int yr))
+                {
+                    try { return new DateTime(yr < 100 ? 2000 + yr : yr, mon, day); } catch { }
+                }
+            }
+
+            // Excel OADate (numeric serial — 1900-01-01 = 1, covers dates up to ~year 2200)
+            if (double.TryParse(text, System.Globalization.NumberStyles.Any,
+                    System.Globalization.CultureInfo.InvariantCulture, out double oaDate)
+                && oaDate > 1 && oaDate < 2958466)
+            {
+                try { return DateTime.FromOADate(oaDate).Date; } catch { }
+            }
+
+            return null;
         }
 
         // ═══════════════════════════════════════════════════════════════
