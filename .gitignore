@@ -1,6 +1,7 @@
 # .NET build artifacts
-WinFormsApp/bin/
-WinFormsApp/obj/
+bin/
+obj/
+TestResults/
 
 # Python cache
 backend/__pycache__/
@@ -10,6 +11,9 @@ backend/__pycache__/
 
 # Python env
 .env
+.env.*
+!.env.example
+.pytest_cache/
 .venv/
 venv/
 __pycache__/

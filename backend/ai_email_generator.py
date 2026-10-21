@@ -2,7 +2,12 @@
 AI Email Generator - Uses Claude to craft personalized follow-up emails.
 """
 
+import os
+
 import anthropic
+
+DEFAULT_MODEL = "claude-sonnet-4-6"
+MAX_NOTES_LENGTH = 500
 
 
 def generate_followup_email(
@@ -14,7 +19,9 @@ def generate_followup_email(
     notes: str = "",
     sender_name: str = "Job Applicant",
 ) -> str:
-    client = anthropic.Anthropic()
+    # Reads ANTHROPIC_API_KEY from the environment; retries transient errors.
+    client = anthropic.Anthropic(timeout=60.0, max_retries=2)
+    notes = (notes or "").strip()[:MAX_NOTES_LENGTH]
 
     follow_up_number = follow_up_count + 1
     ordinal = {1: "first", 2: "second", 3: "third"}.get(follow_up_number, f"{follow_up_number}th")
@@ -43,12 +50,15 @@ Requirements:
 Output only the email (subject + body), nothing else."""
 
     message = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=os.getenv("CLAUDE_MODEL", DEFAULT_MODEL),
         max_tokens=600,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    return message.content[0].text.strip()
+    text_blocks = [b.text for b in message.content if getattr(b, "type", "") == "text"]
+    if not text_blocks or not text_blocks[0].strip():
+        raise ValueError("Claude returned no text for the draft")
+    return text_blocks[0].strip()
 
 
 def get_email_prompt_template() -> str:
