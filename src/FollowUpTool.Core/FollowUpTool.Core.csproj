@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    UI-free logic used by the WinForms app (header mapping, date parsing,
+    follow-up rules, prompt building, API response parsing).
+    Targets plain net8.0 with no package dependencies so it can be built and
+    unit-tested on any OS, including the Linux CI runner.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>FollowUpTool.Core</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+</Project>

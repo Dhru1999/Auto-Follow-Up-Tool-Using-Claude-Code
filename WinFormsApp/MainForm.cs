@@ -18,6 +18,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.IO.Compression;
 using System.Xml.Linq;
+using FollowUpTool.Core;
 
 namespace FollowUpTool
 {
@@ -46,9 +47,24 @@ namespace FollowUpTool
         public string SenderEmail { get; set; } = "";
         public string SenderName { get; set; } = "";
         [JsonIgnore]
-        public string AppPassword { get; set; } = "";       // plain text, memory only
+        public string AppPassword { get; set; } = "";          // plain text, memory only
         public string EncryptedAppPassword { get; set; } = ""; // DPAPI Base64, written to disk
-        public string AnthropicApiKey { get; set; } = "";
+        [JsonIgnore]
+        public string ApiKey { get; set; } = "";               // plain text, memory only
+        public string EncryptedAnthropicApiKey { get; set; } = ""; // DPAPI Base64, written to disk
+
+        // Earlier versions wrote the API key to settings.json in plain text under
+        // this name. It is read once for migration and never written again.
+        [JsonPropertyName("AnthropicApiKey")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? LegacyPlainTextApiKey { get; set; }
+    }
+
+    /// <summary>Windows DPAPI, scoped to the current Windows user.</summary>
+    internal sealed class DpapiProtector : ISecretProtector
+    {
+        public byte[] Protect(byte[] plain) => ProtectedData.Protect(plain, null, DataProtectionScope.CurrentUser);
+        public byte[] Unprotect(byte[] cipher) => ProtectedData.Unprotect(cipher, null, DataProtectionScope.CurrentUser);
     }
 
     // ─────────────────────────── Main Form ───────────────────────────
@@ -82,6 +98,8 @@ namespace FollowUpTool
         private List<JobApplication> _apps = new();
         private JobApplication? _selected;
         private AppSettings _settings = new();
+        private static readonly ISecretProtector Protector = new DpapiProtector();
+        private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(60) };
         private readonly string _settingsPath =
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                          "FollowUpTool", "settings.json");
@@ -98,11 +116,6 @@ namespace FollowUpTool
         public MainForm()
         {
             LoadSettings();
-            if (string.IsNullOrEmpty(_settings.AppPassword))
-            {
-                _settings.AppPassword = "eote kaup xzhi gcfp";
-                SaveSettings();
-            }
             BuildUI();
         }
 
@@ -151,7 +164,7 @@ namespace FollowUpTool
             var lblFile = new Label { Text = "Excel File:", AutoSize = true, Top = 16, Left = 8, ForeColor = Color.FromArgb(80, 80, 80) };
             txtFilePath = new TextBox { Left = 80, Top = 16, Width = 680, Height = 34, Text = _settings.ExcelPath };
             btnBrowse = MakeButton("Browse…", C_BLUE, 770, 14, 80);
-            btnLoad = MakeButton("Load Today's Follow-ups  ↺", C_GREEN, 860, 14, 200);
+            btnLoad = MakeButton("Load Due Follow-ups  ↺", C_GREEN, 860, 14, 200);
             lblFoundCount = new Label { Left = 1070, Top = 20, AutoSize = true, ForeColor = C_DARK, Font = new Font("Segoe UI", 9f, FontStyle.Bold) };
 
             btnBrowse.Click += BtnBrowse_Click;
@@ -212,7 +225,7 @@ namespace FollowUpTool
 
             var header = new Label
             {
-                Text = "Today's Follow-Up Applications",
+                Text = "Follow-Ups Due (today or overdue)",
                 Font = new Font("Segoe UI", 10f, FontStyle.Bold),
                 ForeColor = C_DARK,
                 Dock = DockStyle.Top,
@@ -377,18 +390,18 @@ namespace FollowUpTool
             tbl.Controls.Add(FieldLabel("Sender Email:"), 0, 0);
             txtSenderEmail = new TextBox { Dock = DockStyle.Fill, Text = _settings.SenderEmail, Margin = new Padding(0, 2, 4, 2), PlaceholderText = "you@gmail.com" };
             tbl.Controls.Add(txtSenderEmail, 1, 0);
-            var lblAppPassword = FieldLabel("App Password:"); lblAppPassword.Visible = false;
+            var lblAppPassword = FieldLabel("App Password:");
             tbl.Controls.Add(lblAppPassword, 2, 0);
-            txtAppPassword = new TextBox { Dock = DockStyle.Fill, PasswordChar = '●', Text = _settings.AppPassword, Margin = new Padding(0, 2, 0, 2), PlaceholderText = "Gmail App Password", Enabled = false, Visible = false };
+            txtAppPassword = new TextBox { Dock = DockStyle.Fill, Text = _settings.AppPassword, Margin = new Padding(0, 2, 0, 2), PlaceholderText = "Gmail App Password", UseSystemPasswordChar = true };
             tbl.Controls.Add(txtAppPassword, 3, 0);
 
             // Row 1: Sender Name | [txtSenderName]  API Key | [txtApiKey]
             tbl.Controls.Add(FieldLabel("Sender Name:"), 0, 1);
-            txtSenderName = new TextBox { Dock = DockStyle.Fill, Text = _settings.SenderName, Margin = new Padding(0, 2, 4, 2), PlaceholderText = "Dhrupti Pambhar" };
+            txtSenderName = new TextBox { Dock = DockStyle.Fill, Text = _settings.SenderName, Margin = new Padding(0, 2, 4, 2), PlaceholderText = "Your name" };
             tbl.Controls.Add(txtSenderName, 1, 1);
-            var lblApiKey = FieldLabel("Anthropic Key:"); lblApiKey.Visible = false;
+            var lblApiKey = FieldLabel("Anthropic Key:");
             tbl.Controls.Add(lblApiKey, 2, 1);
-            txtApiKey = new TextBox { Dock = DockStyle.Fill, PasswordChar = '●', Text = _settings.AnthropicApiKey, Margin = new Padding(0, 2, 0, 2), PlaceholderText = "sk-ant-...", Visible = false };
+            txtApiKey = new TextBox { Dock = DockStyle.Fill, UseSystemPasswordChar = true, Text = _settings.ApiKey, Margin = new Padding(0, 2, 0, 2), PlaceholderText = "sk-ant-... (or set ANTHROPIC_API_KEY)" };
             tbl.Controls.Add(txtApiKey, 3, 1);
 
             btnSaveSettings = MakeButton("Save", C_DARK, 590, 34, 70);
@@ -406,52 +419,6 @@ namespace FollowUpTool
         // ═══════════════════════════════════════════════════════════════
         //  Excel Reading
         // ═══════════════════════════════════════════════════════════════
-
-        private static readonly Dictionary<string, string> _colAliases = new(StringComparer.OrdinalIgnoreCase)
-        {
-            ["company name"]        = "Company",
-            ["companyname"]         = "Company",
-            ["company_name"]        = "Company",
-            ["role "]               = "Role",
-            ["job title"]           = "Role",
-            ["date of applied"]     = "AppliedDate",
-            ["date applied"]        = "AppliedDate",
-            ["applied date"]        = "AppliedDate",
-            ["applied_date"]        = "AppliedDate",
-            ["follow up date"]      = "FollowUpDate",
-            ["follow_up_date"]      = "FollowUpDate",
-            ["followup_date"]       = "FollowUpDate",
-            ["followup date"]       = "FollowUpDate",
-            ["company email"]        = "CompanyEmail",
-            ["company_email"]        = "CompanyEmail",
-            ["company emails"]       = "CompanyEmail",
-            ["company_emails"]       = "CompanyEmail",
-            ["recruiter email"]     = "RecruiterEmail",
-            ["recruiter_email"]     = "RecruiterEmail",
-            ["hr email"]            = "HrEmail",
-            ["hr_email"]            = "HrEmail",
-            ["recruiter name"]      = "RecruiterName",
-            ["recruiter_name"]      = "RecruiterName",
-            ["repsonse received"]   = "Status",
-            ["response received"]   = "Status",
-            ["response"]            = "Status",
-            ["feedback"]            = "Status",
-            ["notes"]               = "Notes",
-            ["additional comments"] = "Notes",
-            ["follow up count"]     = "FollowUpCount",
-            ["follow_up_count"]     = "FollowUpCount",
-            ["followup done"]       = "FollowupDone",
-            ["followup_done"]       = "FollowupDone",
-            ["follow up done"]      = "FollowupDone",
-            ["follow_up_done"]      = "FollowupDone",
-        };
-
-        private static string MapHeader(string? raw)
-        {
-            if (raw == null) return "";
-            var key = raw.Trim().ToLowerInvariant();
-            return _colAliases.TryGetValue(key, out var mapped) ? mapped : raw.Trim();
-        }
 
         private List<JobApplication> ReadExcel(string path)
         {
@@ -475,6 +442,7 @@ namespace FollowUpTool
 
             // workbook sheet name → worksheet ZIP path
             var sheetPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            string? firstSheetName = null;
             var wbEntry   = zip.GetEntry("xl/workbook.xml");
             var wbRels    = zip.GetEntry("xl/_rels/workbook.xml.rels");
             if (wbEntry != null && wbRels != null)
@@ -490,11 +458,21 @@ namespace FollowUpTool
                     var name = sh.Attribute("name")?.Value ?? "";
                     var rid  = sh.Attribute(rNs + "id")?.Value ?? "";
                     if (ridMap.TryGetValue(rid, out var target))
+                    {
+                        // Targets are relative to xl/ but may also be written as absolute ("/xl/...").
+                        target = target.TrimStart('/');
                         sheetPaths[name] = target.StartsWith("xl/") ? target : "xl/" + target;
+                        firstSheetName ??= name;
+                    }
                 }
             }
 
-            var sheetNames = new[] { "Internship- Data Engineer", "Status", "Job Applications" };
+            // Sheets are read in this order; if none of them exist the first
+            // sheet of the workbook is used, so any tracker layout works.
+            var preferred = new[] { "Internship- Data Engineer", "Status", "Job Applications" };
+            var sheetNames = preferred.Where(sheetPaths.ContainsKey).ToArray();
+            if (sheetNames.Length == 0 && firstSheetName != null)
+                sheetNames = new[] { firstSheetName };
 
             foreach (var sheetName in sheetNames)
             {
@@ -513,8 +491,8 @@ namespace FollowUpTool
                 var colMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var cell in rows[0].Elements(ssNs + "c"))
                 {
-                    var col    = OxColLetter(cell.Attribute("r")?.Value ?? "");
-                    var header = MapHeader(ZipCellText(cell, sst, ssNs));
+                    var col    = ColumnRef.LettersOf(cell.Attribute("r")?.Value);
+                    var header = HeaderMapper.Map(ZipCellText(cell, sst, ssNs));
                     if (!string.IsNullOrEmpty(header) && !colMap.ContainsKey(header))
                         colMap[header] = col;
                 }
@@ -526,7 +504,7 @@ namespace FollowUpTool
                 {
                     if (!colField.TryGetValue(name, out var col)) return "";
                     var c = row.Elements(ssNs + "c")
-                        .FirstOrDefault(x => OxColLetter(x.Attribute("r")?.Value ?? "")
+                        .FirstOrDefault(x => ColumnRef.LettersOf(x.Attribute("r")?.Value)
                             .Equals(col, StringComparison.OrdinalIgnoreCase));
                     return c != null ? ZipCellText(c, sst, ssNs) : "";
                 }
@@ -535,9 +513,9 @@ namespace FollowUpTool
                 {
                     if (!colField.TryGetValue(name, out var col)) return null;
                     var c = row.Elements(ssNs + "c")
-                        .FirstOrDefault(x => OxColLetter(x.Attribute("r")?.Value ?? "")
+                        .FirstOrDefault(x => ColumnRef.LettersOf(x.Attribute("r")?.Value)
                             .Equals(col, StringComparison.OrdinalIgnoreCase));
-                    return c != null ? ZipParseDate(c, sst, ssNs) : null;
+                    return c != null ? CellDateParser.Parse(ZipCellText(c, sst, ssNs)) : null;
                 }
 
                 foreach (var row in rows.Skip(1))
@@ -546,27 +524,12 @@ namespace FollowUpTool
                     var role    = Field(row, "Role");
                     if (string.IsNullOrEmpty(company) && string.IsNullOrEmpty(role)) continue;
 
-                    if (Field(row, "FollowupDone").Equals("Yes", StringComparison.OrdinalIgnoreCase)) continue;
-
-                    var status = Field(row, "Status");
-                    if (status.Equals("Rejected",       StringComparison.OrdinalIgnoreCase) ||
-                        status.Equals("Withdrawn",      StringComparison.OrdinalIgnoreCase) ||
-                        status.Equals("Offer Received", StringComparison.OrdinalIgnoreCase)) continue;
-
+                    var status       = Field(row, "Status");
                     var appliedDate  = FieldDate(row, "AppliedDate");
-                    var followUpDate = FieldDate(row, "FollowUpDate");
+                    var followUpDate = FollowUpRules.DueDate(appliedDate, FieldDate(row, "FollowUpDate"));
 
-                    if (followUpDate == null && appliedDate.HasValue)
-                        followUpDate = appliedDate.Value.AddDays(7).Date;
-
-                    if (followUpDate?.Date != today) continue;
-
-                    var noResponse = string.IsNullOrEmpty(status) ||
-                        status.Equals("Not yet",     StringComparison.OrdinalIgnoreCase) ||
-                        status.Equals("No yet",      StringComparison.OrdinalIgnoreCase) ||
-                        status.Equals("Applied",     StringComparison.OrdinalIgnoreCase) ||
-                        status.Equals("No Response", StringComparison.OrdinalIgnoreCase);
-                    if (!noResponse) continue;
+                    if (!FollowUpRules.NeedsFollowUp(status, Field(row, "FollowupDone"), appliedDate, followUpDate, today))
+                        continue;
 
                     int.TryParse(Field(row, "FollowUpCount"), out int fuCount);
                     int.TryParse(row.Attribute("r")?.Value, out int rowNum);
@@ -611,36 +574,6 @@ namespace FollowUpTool
             return v;
         }
 
-        private static DateTime? ZipParseDate(XElement cell, List<string> sst, XNamespace ns)
-        {
-            var text = ZipCellText(cell, sst, ns);
-            if (string.IsNullOrEmpty(text)) return null;
-
-            if (DateTime.TryParse(text, out var dt)) return dt.Date;
-
-            if (text.Contains('.'))
-            {
-                var parts = text.Split('.');
-                if (parts.Length == 3 &&
-                    int.TryParse(parts[0], out int day) &&
-                    int.TryParse(parts[1], out int mon) &&
-                    int.TryParse(parts[2], out int yr))
-                {
-                    try { return new DateTime(yr < 100 ? 2000 + yr : yr, mon, day); } catch { }
-                }
-            }
-
-            // Excel OADate (numeric serial — 1900-01-01 = 1, covers dates up to ~year 2200)
-            if (double.TryParse(text, System.Globalization.NumberStyles.Any,
-                    System.Globalization.CultureInfo.InvariantCulture, out double oaDate)
-                && oaDate > 1 && oaDate < 2958466)
-            {
-                try { return DateTime.FromOADate(oaDate).Date; } catch { }
-            }
-
-            return null;
-        }
-
         // ═══════════════════════════════════════════════════════════════
         //  Event Handlers
         // ═══════════════════════════════════════════════════════════════
@@ -650,8 +583,10 @@ namespace FollowUpTool
             using var dlg = new OpenFileDialog
             {
                 Title = "Select Job Applications Excel File",
-                Filter = "Excel Files|*.xlsx;*.xlsm;*.xls|All Files|*.*",
-                InitialDirectory = Path.GetDirectoryName(txtFilePath.Text) ?? Environment.GetFolderPath(Environment.SpecialFolder.Desktop)
+                Filter = "Excel Workbooks (*.xlsx;*.xlsm)|*.xlsx;*.xlsm",
+                InitialDirectory = Directory.Exists(Path.GetDirectoryName(txtFilePath.Text))
+                    ? Path.GetDirectoryName(txtFilePath.Text)
+                    : Environment.GetFolderPath(Environment.SpecialFolder.Desktop)
             };
             if (dlg.ShowDialog() == DialogResult.OK)
                 txtFilePath.Text = dlg.FileName;
@@ -681,11 +616,11 @@ namespace FollowUpTool
                         _settings.ExcelPath = path;
                         SaveSettings();
                         var count = apps.Count;
-                        lblFoundCount.Text = count == 0 ? "No follow-ups due today" : $"{count} follow-up{(count == 1 ? "" : "s")} due today";
+                        lblFoundCount.Text = count == 0 ? "No follow-ups due" : $"{count} follow-up{(count == 1 ? "" : "s")} due";
                         lblFoundCount.ForeColor = count > 0 ? C_ORANGE : Color.Gray;
                         SetStatus(count == 0
-                            ? "No applications are due for follow-up today."
-                            : $"Found {count} application{(count == 1 ? "" : "s")} due for follow-up today (applied 7 days ago with no response).");
+                            ? "No applications are due for follow-up."
+                            : $"Found {count} application{(count == 1 ? "" : "s")} due or overdue for follow-up with no response yet.");
                     });
                 }
                 catch (Exception ex)
@@ -753,7 +688,7 @@ namespace FollowUpTool
                 : $"Hi {app.RecruiterName.Split(' ')[0]},";
             var applied = app.AppliedDate?.ToString("d MMMM yyyy") ?? "recently";
 
-            return $"{greeting}\n\nI wanted to follow up on my application for the {app.Role} position at {app.Company}, submitted on {applied}. I remain very interested in the role and would love to hear if there are any updates on the process.\n\nPlease let me know if you need any additional information from my side.\n\nRegards,\n{txtSenderName.Text.Trim() ?? "Dhrupti"}";
+            return $"{greeting}\n\nI wanted to follow up on my application for the {app.Role} position at {app.Company}, submitted on {applied}. I remain very interested in the role and would love to hear if there are any updates on the process.\n\nPlease let me know if you need any additional information from my side.\n\nRegards,\n{txtSenderName.Text.Trim()}".TrimEnd();
         }
 
         // ── Generate AI Draft ──────────────────────────────────────────
@@ -799,57 +734,29 @@ namespace FollowUpTool
 
         private async Task<string> GenerateAiDraftAsync(JobApplication app, string apiKey)
         {
-            var senderName = txtSenderName.Text.Trim();
-            if (string.IsNullOrEmpty(senderName)) senderName = "Dhrupti";
+            var request = new DraftRequest(app.Company, app.Role, app.RecruiterName, app.AppliedDate,
+                                           app.FollowUpCount, app.Notes, txtSenderName.Text.Trim());
+            var model = Environment.GetEnvironmentVariable("CLAUDE_MODEL") ?? DraftPrompt.DefaultModel;
 
-            var ordinal = (app.FollowUpCount + 1) switch { 1 => "first", 2 => "second", 3 => "third", var n => $"{n}th" };
-            var applied = app.AppliedDate?.ToString("d MMMM yyyy") ?? "recently";
-            var recruiter = string.IsNullOrEmpty(app.RecruiterName) ? "Hiring Team" : app.RecruiterName;
-
-            var prompt = $"""
-                Write a {ordinal} follow-up email for a job application. Follow the tone profile exactly.
-
-                Application Details:
-                - Company: {app.Company}
-                - Role: {app.Role}
-                - Recruiter/Contact: {recruiter}
-                - Applied Date: {applied}
-                - Sender Name: {senderName}
-                - Notes: {app.Notes}
-
-                Tone Profile (follow strictly):
-                - Greeting: "Hi [First Name]," for known contacts, "Hi," for unknown. Never "Dear".
-                - Opening: "Thank you for reaching out!" only when they initiated. For follow-ups, skip opener and get to the point directly.
-                - Body: 2-3 short sentences. One idea per sentence. Direct and warm. No filler phrases.
-                - Sign-off: "Regards,\n{senderName}"
-                - No bullet points, no emojis.
-
-                Output only the email body (no subject line). Keep it under 100 words.
-                """;
-
-            using var http = new HttpClient();
-            http.DefaultRequestHeaders.Add("x-api-key", apiKey);
-            http.DefaultRequestHeaders.Add("anthropic-version", "2023-06-01");
-
-            var payload = new
+            using var message = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages")
             {
-                model = "claude-sonnet-4-6",
-                max_tokens = 400,
-                messages = new[] { new { role = "user", content = prompt } }
+                Content = new StringContent(DraftPrompt.BuildRequestJson(request, model), Encoding.UTF8, "application/json")
             };
+            message.Headers.Add("x-api-key", apiKey);
+            message.Headers.Add("anthropic-version", DraftPrompt.ApiVersion);
 
-            var json = JsonSerializer.Serialize(payload);
-            var resp = await http.PostAsync(
-                "https://api.anthropic.com/v1/messages",
-                new StringContent(json, Encoding.UTF8, "application/json"));
+            HttpResponseMessage resp;
+            try { resp = await Http.SendAsync(message); }
+            catch (TaskCanceledException) { throw new Exception("The Claude API did not respond within 60 seconds. Try again."); }
+            catch (HttpRequestException ex) { throw new Exception($"Could not reach the Claude API: {ex.Message}"); }
 
-            var body = await resp.Content.ReadAsStringAsync();
-            if (!resp.IsSuccessStatusCode)
-                throw new Exception($"API error {(int)resp.StatusCode}: {body}");
-
-            var doc = JsonNode.Parse(body);
-            return doc?["content"]?[0]?["text"]?.GetValue<string>()?.Trim()
-                   ?? throw new Exception("Unexpected API response format.");
+            using (resp)
+            {
+                var body = await resp.Content.ReadAsStringAsync();
+                if (!resp.IsSuccessStatusCode)
+                    throw new Exception(DraftPrompt.DescribeError((int)resp.StatusCode, body));
+                return DraftPrompt.ParseResponse(body);
+            }
         }
 
         // ── Send Email ─────────────────────────────────────────────────
@@ -860,7 +767,7 @@ namespace FollowUpTool
             var subject = txtSubject.Text.Trim();
             var bodyText = rtbBody.Text.Trim();
 
-            if (string.IsNullOrEmpty(to) || !to.Contains('@'))
+            if (!MailAddress.TryCreate(to, out _))
             {
                 MessageBox.Show("Enter a valid recipient email address in the To field.", "Missing Recipient", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 txtTo.Focus();
@@ -941,8 +848,8 @@ namespace FollowUpTool
                 IsBodyHtml = false
             };
             msg.To.Add(new MailAddress(to));
-            if (!string.IsNullOrEmpty(cc) && cc.Contains('@'))
-                msg.CC.Add(new MailAddress(cc));
+            if (MailAddress.TryCreate(cc, out var ccAddress))
+                msg.CC.Add(ccAddress);
 
             using var smtp = new SmtpClient("smtp.gmail.com", 587)
             {
@@ -980,8 +887,8 @@ namespace FollowUpTool
             int maxCol = 0;
             foreach (var c in headerRow.Elements<OXS.Cell>())
             {
-                string colLetter = OxColLetter(c.CellReference?.Value ?? "");
-                int colNum = OxColNum(colLetter);
+                string colLetter = ColumnRef.LettersOf(c.CellReference?.Value);
+                int colNum = ColumnRef.ToNumber(colLetter);
                 if (colNum > maxCol) maxCol = colNum;
                 string val = OxCellText(wbPart, c);
                 if (val.Equals("Followup done", StringComparison.OrdinalIgnoreCase) ||
@@ -1026,7 +933,7 @@ namespace FollowUpTool
 
         private static void OxWriteCell(OXS.SheetData sd, OXS.Row row, uint rowIdx, int colIdx, string value)
         {
-            string cellRef = OxColLetter(colIdx) + rowIdx;
+            string cellRef = ColumnRef.ToLetters(colIdx) + rowIdx;
             var existing = row.Elements<OXS.Cell>()
                 .FirstOrDefault(c => string.Equals(c.CellReference?.Value, cellRef, StringComparison.OrdinalIgnoreCase));
             existing?.Remove();
@@ -1039,23 +946,10 @@ namespace FollowUpTool
             };
 
             var refCell = row.Elements<OXS.Cell>().FirstOrDefault(c =>
-                OxColNum(OxColLetter(c.CellReference?.Value ?? "")) > colIdx);
+                ColumnRef.ToNumber(ColumnRef.LettersOf(c.CellReference?.Value)) > colIdx);
             if (refCell != null) row.InsertBefore(newCell, refCell);
             else row.Append(newCell);
         }
-
-        private static string OxColLetter(string cellRef)
-            => new string(cellRef.TakeWhile(char.IsLetter).ToArray());
-
-        private static string OxColLetter(int col)
-        {
-            string r = "";
-            while (col > 0) { col--; r = (char)('A' + col % 26) + r; col /= 26; }
-            return r;
-        }
-
-        private static int OxColNum(string col)
-            => col.ToUpper().Aggregate(0, (a, c) => a * 26 + (c - 'A' + 1));
 
         // ── Settings persistence ───────────────────────────────────────
 
@@ -1064,7 +958,7 @@ namespace FollowUpTool
             _settings.SenderEmail = txtSenderEmail.Text.Trim();
             _settings.SenderName = txtSenderName.Text.Trim();
             _settings.AppPassword = txtAppPassword.Text.Trim();
-            _settings.AnthropicApiKey = txtApiKey.Text.Trim();
+            _settings.ApiKey = txtApiKey.Text.Trim();
             _settings.ExcelPath = txtFilePath.Text.Trim();
             SaveSettings();
             SetStatus("Settings saved.");
@@ -1074,45 +968,46 @@ namespace FollowUpTool
         {
             try
             {
-                if (File.Exists(_settingsPath))
+                if (!File.Exists(_settingsPath)) return;
+                var json = File.ReadAllText(_settingsPath);
+                _settings = JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
+                _settings.AppPassword = SettingsSecrets.Decrypt(Protector, _settings.EncryptedAppPassword);
+                _settings.ApiKey = SettingsSecrets.Decrypt(Protector, _settings.EncryptedAnthropicApiKey);
+
+                // One-time migration: re-save a key that older versions stored in plain text.
+                if (!string.IsNullOrEmpty(_settings.LegacyPlainTextApiKey))
                 {
-                    var json = File.ReadAllText(_settingsPath);
-                    _settings = JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
-                    _settings.AppPassword = DecryptPassword(_settings.EncryptedAppPassword);
+                    if (string.IsNullOrEmpty(_settings.ApiKey))
+                        _settings.ApiKey = _settings.LegacyPlainTextApiKey;
+                    SaveSettings();
                 }
             }
-            catch { _settings = new AppSettings(); }
+            catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+            {
+                _settings = new AppSettings();
+            }
         }
 
         private void SaveSettings()
         {
             try
             {
-                _settings.EncryptedAppPassword = EncryptPassword(_settings.AppPassword);
+                _settings.EncryptedAppPassword = SettingsSecrets.Encrypt(Protector, _settings.AppPassword);
+                _settings.EncryptedAnthropicApiKey = SettingsSecrets.Encrypt(Protector, _settings.ApiKey);
+                _settings.LegacyPlainTextApiKey = null;
                 Directory.CreateDirectory(Path.GetDirectoryName(_settingsPath)!);
                 File.WriteAllText(_settingsPath, JsonSerializer.Serialize(_settings, new JsonSerializerOptions { WriteIndented = true }));
             }
-            catch { /* non-fatal */ }
-        }
-
-        private static string EncryptPassword(string plainText)
-        {
-            if (string.IsNullOrEmpty(plainText)) return "";
-            var bytes = Encoding.UTF8.GetBytes(plainText);
-            var encrypted = ProtectedData.Protect(bytes, null, DataProtectionScope.CurrentUser);
-            return Convert.ToBase64String(encrypted);
-        }
-
-        private static string DecryptPassword(string encryptedBase64)
-        {
-            if (string.IsNullOrEmpty(encryptedBase64)) return "";
-            try
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or CryptographicException)
             {
-                var bytes = Convert.FromBase64String(encryptedBase64);
-                var decrypted = ProtectedData.Unprotect(bytes, null, DataProtectionScope.CurrentUser);
-                return Encoding.UTF8.GetString(decrypted);
+                SetStatusSafe($"Could not save settings: {ex.Message}");
             }
-            catch { return ""; }
+        }
+
+        // SaveSettings can run before the status bar exists (during LoadSettings).
+        private void SetStatusSafe(string msg)
+        {
+            if (statusLabel != null) SetStatus(msg);
         }
 
         // ═══════════════════════════════════════════════════════════════
