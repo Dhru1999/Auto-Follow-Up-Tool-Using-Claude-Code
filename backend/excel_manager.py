@@ -252,6 +252,7 @@ def save_application_update(file_path: str, app_id: str, updates: dict) -> bool:
             print("Error saving update: ID column not found")
             return False
 
+        found = False
         for row in ws.iter_rows(min_row=2):
             row_id = str(row[id_col - 1].value or "").strip()
             if row_id == str(app_id):
@@ -259,8 +260,11 @@ def save_application_update(file_path: str, app_id: str, updates: dict) -> bool:
                     col_idx = header.get(field)
                     if col_idx:
                         row[col_idx - 1].value = value
+                found = True
                 break
 
+        if not found:
+            return False
         wb.save(file_path)
         return True
     except Exception as e:
